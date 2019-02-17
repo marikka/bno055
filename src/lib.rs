@@ -1,17 +1,17 @@
 extern crate byteorder;
-extern crate i2cdev;
+extern crate embedded_hal as hal;
 extern crate i2csensors;
 
 use byteorder::{ByteOrder, LittleEndian};
-use i2cdev::core::I2CDevice;
+use hal::blocking::i2c::{Write, Read, WriteRead};
 use i2csensors::{Accelerometer, Gyroscope, Thermometer, Magnetometer, Vec3};
 
 use std::thread;
 use std::time::Duration;
 use std::mem;
 
-pub const BNO055_DEFAULT_ADDR: u16 = 0x28;
-pub const BNO055_ALTERNATE_ADDR: u16 = 0x29;
+pub const BNO055_DEFAULT_ADDR: u8 = 0x28;
+pub const BNO055_ALTERNATE_ADDR: u8 = 0x29;
 pub const BNO055_ID: u8 = 0xA0;
 
 pub const BNO055_PAGE_ID: u8 = 0x07;
@@ -219,45 +219,69 @@ pub enum BNO055OperationMode {
 }
 
 #[derive(Copy, Clone)]
-pub struct BNO055<T: I2CDevice + Sized> {
-    pub i2cdev: T,
+pub struct BNO055<I2C> {
+    pub i2cdev: I2C,
     pub mode: BNO055OperationMode,
+    device_address: u8
 }
 
-impl<T> BNO055<T>
+impl<I2C, E> BNO055<I2C>
 where
-    T: I2CDevice + Sized,
+    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
 {
-    pub fn new(mut i2cdev: T) -> Result<Self, T::Error> {
-        let chip_id = i2cdev.smbus_read_byte_data(BNO055_CHIP_ID)?;
+    pub fn new(i2cdev: I2C, device_address: u8) -> Result<Self, E> {
+        let mut bno = BNO055 {
+            i2cdev: i2cdev,
+            device_address,
+            mode: BNO055OperationMode::ConfigMode,
+        };
+        let chip_id = bno.read_byte_data(BNO055_CHIP_ID)?;
+
         if chip_id != BNO055_ID {
             // TODO: Do correct error handling
             panic!("BNO055_CHIP_ID was not valid!");
         }
-
-        let mut bno = BNO055 {
-            i2cdev: i2cdev,
-            mode: BNO055OperationMode::ConfigMode,
-        };
         bno.set_mode(BNO055OperationMode::ConfigMode)?;
         bno.set_page(BNO055RegisterPage::Page0)?;
         bno.set_power_mode(BNO055PowerMode::Normal)?;
-        bno.i2cdev.smbus_write_byte_data(BNO055_SYS_TRIGGER, 0x0)?;
+        bno.write_byte_data(BNO055_SYS_TRIGGER, 0x0)?;
 
         Ok(bno)
     }
 
+    fn write_byte_data(&mut self, register: u8, value: u8) -> Result<(), E> {
+        self.i2cdev.write(self.device_address, &[register, value])?;
+        Ok(())
+    }
+
+    fn write_block_data(&mut self, register: u8, values: &[u8]) -> Result<(), E> {
+        self.i2cdev.write(self.device_address, &[&[register], &values[..]].concat())?;
+        Ok(())
+    }
+
+    fn read_byte_data(&mut self, register: u8) -> Result<u8, E> {
+        let mut buf = [0;1];
+        self.i2cdev.write_read(self.device_address, &[register], &mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_block_data(&mut self, register: u8, len: usize) -> Result<Vec<u8>, E> {
+        let mut buf = vec![0; len];
+        self.i2cdev.write_read(self.device_address, &[register], &mut buf)?;
+        Ok(buf.to_vec())
+    }
+
     /// Reset the BNO055, initializing the register map to default values
     /// More in section 3.2
-    pub fn reset(&mut self) -> Result<(), T::Error> {
-        Ok(self.i2cdev.smbus_write_byte_data(BNO055_SYS_TRIGGER, 0x20)?)
+    pub fn reset(&mut self) -> Result<(), E> {
+        Ok(self.write_byte_data(BNO055_SYS_TRIGGER, 0x20)?)
     }
 
     /// Sets the operating mode, see [BNO055OperationMode](enum.BNO055OperationMode.html)
     /// More in section 3.3
-    pub fn set_mode(&mut self, mode: BNO055OperationMode) -> Result<(), T::Error> {
+    pub fn set_mode(&mut self, mode: BNO055OperationMode) -> Result<(), E> {
         if self.mode != mode {
-            self.i2cdev.smbus_write_byte_data(
+            self.write_byte_data(
                 BNO055_OPR_MODE,
                 mode as u8,
             )?;
@@ -268,10 +292,10 @@ where
         Ok(())
     }
 
-    pub fn set_external_crystal(&mut self, ext: bool) -> Result<(), T::Error> {
+    pub fn set_external_crystal(&mut self, ext: bool) -> Result<(), E> {
         let prev = self.mode;
         self.set_mode(BNO055OperationMode::ConfigMode)?;
-        self.i2cdev.smbus_write_byte_data(
+        self.write_byte_data(
             BNO055_SYS_TRIGGER,
             if ext { 0x80 } else { 0x00 },
         )?;
@@ -281,8 +305,8 @@ where
 
     /// Sets the power mode, see [BNO055PowerMode](enum.BNO055PowerMode.html)
     /// More in section 3.2
-    pub fn set_power_mode(&mut self, mode: BNO055PowerMode) -> Result<(), T::Error> {
-        self.i2cdev.smbus_write_byte_data(
+    pub fn set_power_mode(&mut self, mode: BNO055PowerMode) -> Result<(), E> {
+        self.write_byte_data(
             BNO055_PWR_MODE,
             mode as u8,
         )?;
@@ -291,8 +315,8 @@ where
 
     /// Sets the register page
     /// More in section 4.2
-    pub fn set_page(&mut self, page: BNO055RegisterPage) -> Result<(), T::Error> {
-        self.i2cdev.smbus_write_byte_data(
+    pub fn set_page(&mut self, page: BNO055RegisterPage) -> Result<(), E> {
+        self.write_byte_data(
             BNO055_PAGE_ID,
             page as u8,
         )?;
@@ -301,8 +325,8 @@ where
 
     /// Gets a quaternion reading from the BNO055
     /// Must be in a valid operating mode
-    pub fn get_quaternion(&mut self) -> Result<BNO055QuaternionReading, T::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+    pub fn get_quaternion(&mut self) -> Result<BNO055QuaternionReading, E> {
+        let buf = self.read_block_data(
             BNO055_QUA_DATA_W_LSB,
             8,
         )?;
@@ -322,9 +346,9 @@ where
 
     /// Gets the revision of software, bootloader, accelerometer, magnetometer, and gyroscope of
     /// the BNO055
-    pub fn get_revision(&mut self) -> Result<BNO055Revision, T::Error> {
+    pub fn get_revision(&mut self) -> Result<BNO055Revision, E> {
         // TODO: Check page
-        let buf = self.i2cdev.smbus_read_i2c_block_data(BNO055_ACC_ID, 6)?;
+        let buf = self.read_block_data(BNO055_ACC_ID, 6)?;
         Ok(BNO055Revision {
             software: LittleEndian::read_u16(&buf[3..5]),
             bootloader: buf[5],
@@ -335,20 +359,20 @@ where
     }
 
     /// Get the system status
-    pub fn get_system_status(&mut self, run: bool) -> Result<BNO055SystemStatus, T::Error> {
+    pub fn get_system_status(&mut self, run: bool) -> Result<BNO055SystemStatus, E> {
         let selftest = if run {
             let prev = self.mode;
             self.set_mode(BNO055OperationMode::ConfigMode)?;
 
-            let sys_trigger = self.i2cdev.smbus_read_byte_data(BNO055_SYS_TRIGGER)?;
-            self.i2cdev.smbus_write_byte_data(
+            let sys_trigger = self.read_byte_data(BNO055_SYS_TRIGGER)?;
+            self.write_byte_data(
                 BNO055_SYS_TRIGGER,
                 sys_trigger | 0x1,
             )?;
 
             thread::sleep(Duration::from_secs(1));
 
-            let result = self.i2cdev.smbus_read_byte_data(BNO055_ST_RESULT)?;
+            let result = self.read_byte_data(BNO055_ST_RESULT)?;
             self.set_mode(prev)?;
             Some(result)
         } else {
@@ -356,15 +380,15 @@ where
         };
 
         Ok(BNO055SystemStatus {
-            status: unsafe { mem::transmute(self.i2cdev.smbus_read_byte_data(BNO055_SYS_STATUS)?) },
-            error: unsafe { mem::transmute(self.i2cdev.smbus_read_byte_data(BNO055_SYS_ERR)?) },
+            status: unsafe { mem::transmute(self.read_byte_data(BNO055_SYS_STATUS)?) },
+            error: unsafe { mem::transmute(self.read_byte_data(BNO055_SYS_ERR)?) },
             selftest,
         })
     }
 
     /// Get the calibration status
-    pub fn get_calibration_status(&mut self) -> Result<BNO055CalibrationStatus, T::Error> {
-        let status = self.i2cdev.smbus_read_byte_data(BNO055_CALIB_STAT)?;
+    pub fn get_calibration_status(&mut self) -> Result<BNO055CalibrationStatus, E> {
+        let status = self.read_byte_data(BNO055_CALIB_STAT)?;
         let sys = (status & 0b11000000) >> 6 == 0b11;
         let gyr = (status & 0b00110000) >> 6 == 0b11;
         let acc = (status & 0b00001100) >> 6 == 0b11;
@@ -376,9 +400,9 @@ where
     // TODO: Make this calibration a struct
     /// Get the calibration details. Can be used with [set_calibration](fn.set_calibration.html) to
     /// load previous configs.
-    pub fn get_calibration(&mut self) -> Result<Vec<u8>, T::Error> {
+    pub fn get_calibration(&mut self) -> Result<Vec<u8>, E> {
         let prev = self.mode;
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+        let buf = self.read_block_data(
             BNO055_ACC_OFFSET_X_LSB,
             22,
         );
@@ -389,9 +413,9 @@ where
     // TODO: Use a calibration struct, check for buf length
     /// Set the calibration details. Can be used with [get_calibration](fn.get_calibration.html) to
     /// load previous configs.
-    pub fn set_calibration(&mut self, buf: Vec<u8>) -> Result<(), T::Error> {
+    pub fn set_calibration(&mut self, buf: Vec<u8>) -> Result<(), E> {
         let prev = self.mode;
-        self.i2cdev.smbus_write_block_data(
+        self.write_block_data(
             BNO055_ACC_OFFSET_X_LSB,
             &buf,
         )?;
@@ -403,8 +427,8 @@ where
 
     /// Get euler angle representation of orientation.
     /// The `x` component is the heading, `y` is the roll, `z` is pitch, all in radians
-    pub fn get_euler(&mut self) -> Result<Vec3, T::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+    pub fn get_euler(&mut self) -> Result<Vec3, E> {
+        let buf = self.read_block_data(
             BNO055_EUL_HEADING_LSB,
             6,
         )?;
@@ -420,8 +444,8 @@ where
         })
     }
 
-    pub fn get_linear_acceleration(&mut self) -> Result<Vec3, T::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+    pub fn get_linear_acceleration(&mut self) -> Result<Vec3, E> {
+        let buf = self.read_block_data(
             BNO055_LIA_DATA_X_LSB,
             6,
         )?;
@@ -440,14 +464,15 @@ where
     // TODO: linear acceleration, gravity
 }
 
-impl<T> Magnetometer for BNO055<T>
+impl<I2C, E> Magnetometer for BNO055<I2C>
 where
-    T: I2CDevice + Sized,
+    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    E: std::error::Error
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn magnetic_reading(&mut self) -> Result<Vec3, Self::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+        let buf = self.read_block_data(
             BNO055_MAG_DATA_X_LSB,
             6,
         )?;
@@ -464,14 +489,15 @@ where
     }
 }
 
-impl<T> Gyroscope for BNO055<T>
+impl<I2C, E> Gyroscope for BNO055<I2C>
 where
-    T: I2CDevice + Sized,
+    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    E: std::error::Error
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn angular_rate_reading(&mut self) -> Result<Vec3, Self::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+        let buf = self.read_block_data(
             BNO055_GYR_DATA_X_LSB,
             6,
         )?;
@@ -488,14 +514,15 @@ where
     }
 }
 
-impl<T> Accelerometer for BNO055<T>
+impl<I2C, E> Accelerometer for BNO055<I2C>
 where
-    T: I2CDevice + Sized,
+    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    E: std::error::Error
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn acceleration_reading(&mut self) -> Result<Vec3, Self::Error> {
-        let buf = self.i2cdev.smbus_read_i2c_block_data(
+        let buf = self.read_block_data(
             BNO055_ACC_DATA_X_LSB,
             6,
         )?;
@@ -512,14 +539,15 @@ where
     }
 }
 
-impl<T> Thermometer for BNO055<T>
+impl<I2C, E> Thermometer for BNO055<I2C>
 where
-    T: I2CDevice + Sized,
+    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    E: std::error::Error
 {
-    type Error = T::Error;
+    type Error = E;
 
     fn temperature_celsius(&mut self) -> Result<f32, Self::Error> {
-        Ok(self.i2cdev.smbus_read_byte_data(BNO055_TEMP)? as u8 as f32)
+        Ok(self.read_byte_data(BNO055_TEMP)? as u8 as f32)
     }
 }
 
